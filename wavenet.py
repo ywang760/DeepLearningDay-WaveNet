@@ -1,127 +1,196 @@
-# import packages
 import numpy as np
-import tensorflow as tf
+import pandas as pd
+import os
+for dirname, _, filenames in os.walk('/kaggle/input'):
+    for filename in filenames:
+        print(os.path.join(dirname, filename))
+from music21 import *
+from collections import Counter
+from sklearn.model_selection import train_test_split
 
 
-class Conv(tf.keras.layers.Layer):
-    """
-    A convolution
-    """
+class Preprocess():
+    def __init__(self):
+        self.unique_x = None
+        self.unique_y = None
 
-    def __init__(self, in_channels, out_channels, kernel_size=1, stride=1,
-                 dilation=1, bias=True, w_init_gain='linear', is_causal=False):
-        super(Conv, self).__init__()
-        self.is_causal = is_causal
-        self.kernel_size = kernel_size
-        self.dilation = dilation
-        self.conv = tf.keras.layers.Conv1D(filter=out_channels,
-                                           kernel_size=kernel_size,
-                                           stride=stride,
-                                           dilation_rate=dilation,
-                                           use_bias=bias)
+    def read_midi(self, file):
+        print("Loading Music File:", file)
+        notes = []
+        notes_to_parse = None
+        # parsing a midi file
+        midi = converter.parse(file)
+        # grouping based on different instruments
+        s2 = instrument.partitionByInstrument(midi)
+        # Looping over all the instruments
+        for part in s2.parts:
+            # select elements of only piano
+            if 'Piano' in str(part):
+                notes_to_parse = part.recurse()
+                # finding whether a particular element is note or a chord
+                for element in notes_to_parse:
+                    # note
+                    if isinstance(element, note.Note):
+                        notes.append(str(element.pitch))
+                    # chord
+                    elif isinstance(element, chord.Chord):
+                        notes.append('.'.join(str(n) for n in element.normalOrder))
+        return np.array(notes)
 
-    def forward(self, signal):
-        if self.is_causal:
-               padding = (int((self.kernel_size - 1) * self.dilation), 0)
-               signal = tf.pad(signal, padding, "CONSTANT")
-        return self.conv(signal)
+
+    def read_all_midi(self, path):
+        files = [i for i in os.listdir(path) if i.endswith(".mid")]
+        print(files)
+        notes_array = np.array([self.read_midi(path + i) for i in files])
+        return notes_array
+
+
+    def prepare(self, notes_array):
+        notes_ = [element for note_ in notes_array for element in note_]
+        # computing frequency of each note
+        freq = dict(Counter(notes_))
+        frequent_notes = [note_ for note_, count in freq.items() if count >= 50]
+
+        new_music = []
+
+        for notes in notes_array:
+            temp = []
+            for note_ in notes:
+                if note_ in frequent_notes:
+                    temp.append(note_)
+            new_music.append(temp)
+
+        new_music = np.array(new_music)
+        no_of_timesteps = 32
+        x = []
+        y = []
+
+        for note_ in new_music:
+            for i in range(0, len(note_) - no_of_timesteps, 1):
+                # preparing input and output sequences
+                input_ = note_[i:i + no_of_timesteps]
+                output = note_[i + no_of_timesteps]
+
+                x.append(input_)
+                y.append(output)
+
+        x = np.array(x)
+        y = np.array(y)
+        unique_x = list(set(x.ravel()))
+        self.unique_x = unique_x
+        x_note_to_int = dict((note_, number) for number, note_ in enumerate(unique_x))
+        x_seq = []
+        for i in x:
+            temp = []
+            for j in i:
+                # assigning unique integer to every note
+                temp.append(x_note_to_int[j])
+            x_seq.append(temp)
+
+        x_seq = np.array(x_seq)
+        unique_y = list(set(y))
+        self.unique_y = unique_y
+        y_note_to_int = dict((note_, number) for number, note_ in enumerate(unique_y))
+        y_seq = np.array([y_note_to_int[i] for i in y])
+
+        x_tr, x_val, y_tr, y_val = train_test_split(x_seq, y_seq, test_size=0.2, random_state=0)
+
+        return x_tr, x_val, y_tr, y_val
+
+    def get_unique(self):
+        return self.unique_x, self.unique_y
 
 
 
-class Wavenet(tf.keras.layers.Layer):
-    def __init__(self, pad, sd, rd, dilations0,dilations1,device):
-        self.dilations1 = dilations1
-        self.device=device
-        sd = 512
-        rd = 128
-        self.sd = sd
-        self.rd = rd
-        self.init_filter=2
-        self.field=np.sum(dilations1)+self.init_filter
-        wd = 128
-        print('sd rd:',sd,rd)
-        self.wd=wd
-        super(Wavenet, self).__init__()
-        self.embedy = tf.keras.layers.Embedding(256, wd)
-        self.casual = tf.keras.layers.Conv1D(filter=wd, kernel_size=self.init_filter)
-        self.pad = pad
-        self.ydcnn  = tf.keras.Sequential()
-        self.ydense = tf.keras.Sequential()
-        self.yskip = tf.keras.Sequential()
+from keras.layers import (Dense,Flatten,Conv1D,Embedding,MaxPool1D,Dropout,GlobalMaxPool1D)
+from keras.models import Sequential
+from keras.callbacks import ModelCheckpoint
+import random
 
-        for i, d in enumerate(self.dilations1):
-            self.ydcnn.add(Conv(wd*2,kernel_size=2, dilation=d, w_init_gain='tanh', is_causal=True))
-            self.yskip.add(Conv(wd, sd,w_init_gain='relu'))
-            self.ydense.add(Conv(wd, wd,w_init_gain='linear'))
+class Wavenet():
+    def __init__(self):
+        self.no_of_timesteps = 32
+        self.model = Sequential()
 
-        self.post1 = Conv(sd, sd, bias=False, w_init_gain='relu')
-        self.post2 = Conv(sd, 256, bias=False, w_init_gain='linear')
+    def construct(self, len_x, len_y): #len_x和len_y是一样的，这是源代码中不同音符的数量47
+        self.model.add(Embedding(len_x, 100, input_length=32, trainable=True)) #为什么这里要用len_y
+        self.model.add(Conv1D(64, 3, padding='causal', activation='relu'))
+        self.model.add(Dropout(0.2))
+        self.model.add(MaxPool1D(2))
+        self.model.add(Conv1D(128, 3, activation='relu', dilation_rate=2, padding='causal'))
+        self.model.add(Dropout(0.2))
+        self.model.add(MaxPool1D(2))
+        self.model.add(Conv1D(256, 3, activation='relu', dilation_rate=4, padding='causal'))
+        self.model.add(Dropout(0.2))
+        self.model.add(MaxPool1D(2))
+        self.model.add(GlobalMaxPool1D())
+        self.model.add(Dense(256, activation='relu'))
+        self.model.add(Dense(len_y, activation='softmax')) #我不清楚为什么要用len_y，但是我不知道为什么要用这个数字
+        self.model.compile(loss='sparse_categorical_crossentropy', optimizer='adam', metrics=['acc'])
+        self.model.summary()
 
-    def forward(self, y):
-        y = self.embedy(y.long())
-        y = y.transpose(1, 2)
+    def fit(self, x_tr, x_val, y_tr, y_val ):
+        self.model.fit(np.array(x_tr), np.array(y_tr), batch_size=128, epochs=5,
+                  validation_data=(np.array(x_val), np.array(y_val)), verbose=1)
 
-        finalout = y.size(2)-(self.field-1)
 
-        output = 0
-        for i, d in enumerate(self.dilations1):
-            in_act = self.ydcnn[i](y)
-            in_act = in_act
-            t_act = tf.math.tanh(in_act[:, :self.wd, :])
-            s_act = tf.math.sigmoid(in_act[:, self.wd:, :])
-            acts = t_act * s_act
+    def predict(self, x_val, unique_x):
+        ind = np.random.randint(0, len(x_val) - 1)
 
-            res_acts = self.ydense[i](acts)
+        random_music = x_val[ind]
 
-            if i == 0:
-                output = self.yskip[i](acts[:,:,-finalout:])
+        predictions = []
+        for i in range(10):
+            random_music = random_music.reshape(1, self.no_of_timesteps)
+
+            prob = self.model.predict(random_music)[0]
+            y_pred = np.argmax(prob, axis=0)
+            predictions.append(y_pred)
+
+            random_music = np.insert(random_music[0], len(random_music[0]), y_pred)
+            random_music = random_music[1:]
+
+        x_int_to_note = dict((number, note_) for number, note_ in enumerate(unique_x))
+        predicted_notes = [x_int_to_note[i] for i in predictions]
+
+        return predicted_notes
+
+
+
+class ToMidi():
+    def __init__(self):
+        pass
+
+    def to_midi(self, prediction_output):
+        offset = 0
+        output_notes = []
+
+        # create note and chord objects based on the values generated by the model
+        for pattern in prediction_output:
+
+            # pattern is a chord
+            if ('.' in pattern) or pattern.isdigit():
+                notes_in_chord = pattern.split('.')
+                notes = []
+                for current_note in notes_in_chord:
+                    cn = int(current_note)
+                    new_note = note.Note(cn)
+                    new_note.storedInstrument = instrument.Piano()
+                    notes.append(new_note)
+
+                new_chord = chord.Chord(notes)
+                new_chord.offset = offset
+                output_notes.append(new_chord)
+
+            # pattern is a note
             else:
-                output = self.yskip[i](acts[:,:,-finalout:]) + output
 
-            y = res_acts + y[:,:,d:]
+                new_note = note.Note(pattern)
+                new_note.offset = offset
+                new_note.storedInstrument = instrument.Piano()
+                output_notes.append(new_note)
 
-        output = tf.nn.relu(output)
-        output = self.post1(output)
-        output = tf.nn.relu(output)
-        output = self.post2(output)
-        return output
-
-
-    def infer(self,queue,l = 16000*1):
-        y = tf.random.uniform(1, 0, 255)
-        l = int(l)
-        music=tf.zeros(l)
-        output = 0
-        for idx in range(l):
-            y = self.embedy(y.long())
-            y = y.transpose(1, 2)
-            for i, d in enumerate(self.dilations1):
-                y = tf.concat((queue[i],y),2)
-                if d == 1:
-                    queue[i] = y[:,:,:1].clone()
-                else:
-                    queue[i] = tf.concat((queue[i][:, :, 1:], y[:, :, :1]), 2)
-                in_act = self.ydcnn[i](y)
-                t_act = tf.math.tanh(in_act[:, :self.wd, :])
-                s_act = tf.math.sigmoid(in_act[:, self.wd:, :])
-                acts = t_act * s_act
-
-                res_acts = self.ydense[i](acts)
-
-                if i == 0:
-                    output = self.yskip[i](acts[:,:,-1:])
-                else:
-                    output = self.yskip[i](acts[:,:,-1:]) + output
-
-                y = res_acts + y[:,:,d:]
-
-            output = tf.nn.relu(output)
-            output = self.post1(output)
-            output = tf.nn.relu(output)
-            output = self.post2(output)
-            #################################################
-            y = output.max(1, keepdim=True)[1].view(-1)[0]
-            y = tf.math.reduce_max(output, keepdims=True)
-            y = y.view(1,1)
-            music[idx] = y.cpu()[0,0]
-        return music
+            # increase offset each iteration so that notes do not stack
+            offset += 1
+        midi_stream = stream.Stream(output_notes)
+        midi_stream.write('midi', fp='music.mid')
