@@ -150,10 +150,10 @@ class Wavenet():
             random_music = np.insert(random_music[0], len(random_music[0]), y_pred)
             random_music = random_music[1:]
 
-        x_int_to_note = dict((number, note_) for number, note_ in enumerate(unique_x))
-        predicted_notes = [x_int_to_note[i] for i in predictions]
+        # x_int_to_note = dict((number, note_) for number, note_ in enumerate(unique_x))
+        # predicted_notes = [x_int_to_note[i] for i in predictions]
 
-        return predicted_notes
+        return predictions
 
 
 class ToMidi():
