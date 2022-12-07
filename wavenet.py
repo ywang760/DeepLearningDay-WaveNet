@@ -156,7 +156,6 @@ class Wavenet():
         return predicted_notes
 
 
-
 class ToMidi():
     def __init__(self):
         pass
