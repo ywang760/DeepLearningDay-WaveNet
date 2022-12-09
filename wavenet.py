@@ -1,195 +1,56 @@
 import numpy as np
-import pandas as pd
-import os
-for dirname, _, filenames in os.walk('/kaggle/input'):
-    for filename in filenames:
-        print(os.path.join(dirname, filename))
-from music21 import *
-from collections import Counter
-from sklearn.model_selection import train_test_split
+import tensorflow as tf 
+import tensorflow.keras.layers as layers
+import soundfile as sf
 
+def mu_law_decode(signal, quantization_channels):
+    # Calculate inverse mu-law companding and dequantization
+    mu = quantization_channels - 1
+    # Map signal from [0, mu-1] to [-1, +1]
+    signal = 2 * (signal.astype(np.float32) / mu) - 1
+    signal = np.sign(signal) * (1.0 / mu) * ((1.0 + mu)**abs(signal) - 1.0)
+    return signal
 
-class Preprocess():
-    def __init__(self):
-        self.unique_x = None
-        self.unique_y = None
+class Wavenet(tf.keras.Model):
+    def __init__(self, timesteps = 32, output_dims = 256, quantization_channels=256, **kwargs):
+        super().__init__(**kwargs)
+        self.timesteps = timesteps
+        self.output_dims = output_dims
+        self.quantization_channels = quantization_channels
+        self.model = tf.keras.Sequential([
+            layers.Embedding(self.quantization_channels, 100, input_length=32, trainable=True),
+            layers.Conv1D(64, 3, padding='causal', activation='relu'),
+            layers.Dropout(0.2),
+            layers.MaxPool1D(2),
+            layers.Conv1D(128, 3, activation='relu', dilation_rate=2, padding='causal'),
+            layers.Dropout(0.2),
+            layers.MaxPool1D(2),
+            layers.Conv1D(256, 3, activation='relu', dilation_rate=4, padding='causal'),
+            layers.Dropout(0.2),
+            layers.MaxPool1D(2),
+            layers.GlobalMaxPool1D(),
+            layers.Dense(256, activation='relu'),
+            layers.Dense(self.output_dims, activation='softmax'),
+        ])
 
-    def read_midi(self, file):
-        print("Loading Music File:", file)
-        notes = []
-        notes_to_parse = None
-        # parsing a midi file
-        midi = converter.parse(file)
-        # grouping based on different instruments
-        s2 = instrument.partitionByInstrument(midi)
-        # Looping over all the instruments
-        for part in s2.parts:
-            # select elements of only piano
-            if 'Piano' in str(part):
-                notes_to_parse = part.recurse()
-                # finding whether a particular element is note or a chord
-                for element in notes_to_parse:
-                    # note
-                    if isinstance(element, note.Note):
-                        notes.append(str(element.pitch))
-                    # chord
-                    elif isinstance(element, chord.Chord):
-                        notes.append('.'.join(str(n) for n in element.normalOrder))
-        return np.array(notes)
+    def call(self, inputs):
+        return self.model(inputs)
 
+    def generate(self, generate_time, sampling_rate):
+        mean = self.quantization_channels / 2
+        std = mean * 0.909
+        no_samples = generate_time * sampling_rate
+        inputs = tf.random.normal((no_samples, self.timesteps), mean=mean, stddev=std, dtype=tf.float32)
 
-    def read_all_midi(self, path):
-        files = [i for i in os.listdir(path) if i.endswith(".mid")]
-        print(files)
-        notes_array = np.array([self.read_midi(path + i) for i in files])
-        return notes_array
+        # forward pass:
+        predicted_output = self.model.predict(inputs)
+        print(f"Model prediction has shape {predicted_output.shape}")
 
+        # generate predictions
+        labels = np.argmax(predicted_output, axis=-1)
+        print(f"Labels has shape {labels.shape}")
 
-    def prepare(self, notes_array):
-        notes_ = [element for note_ in notes_array for element in note_]
-        # computing frequency of each note
-        freq = dict(Counter(notes_))
-        frequent_notes = [note_ for note_, count in freq.items() if count >= 50]
-
-        new_music = []
-
-        for notes in notes_array:
-            temp = []
-            for note_ in notes:
-                if note_ in frequent_notes:
-                    temp.append(note_)
-            new_music.append(temp)
-
-        new_music = np.array(new_music)
-        no_of_timesteps = 32
-        x = []
-        y = []
-
-        for note_ in new_music:
-            for i in range(0, len(note_) - no_of_timesteps, 1):
-                # preparing input and output sequences
-                input_ = note_[i:i + no_of_timesteps]
-                output = note_[i + no_of_timesteps]
-
-                x.append(input_)
-                y.append(output)
-
-        x = np.array(x)
-        y = np.array(y)
-        unique_x = list(set(x.ravel()))
-        self.unique_x = unique_x
-        x_note_to_int = dict((note_, number) for number, note_ in enumerate(unique_x))
-        x_seq = []
-        for i in x:
-            temp = []
-            for j in i:
-                # assigning unique integer to every note
-                temp.append(x_note_to_int[j])
-            x_seq.append(temp)
-
-        x_seq = np.array(x_seq)
-        unique_y = list(set(y))
-        self.unique_y = unique_y
-        y_note_to_int = dict((note_, number) for number, note_ in enumerate(unique_y))
-        y_seq = np.array([y_note_to_int[i] for i in y])
-
-        x_tr, x_val, y_tr, y_val = train_test_split(x_seq, y_seq, test_size=0.2, random_state=0)
-
-        return x_tr, x_val, y_tr, y_val
-
-    def get_unique(self):
-        return self.unique_x, self.unique_y
-
-
-
-from keras.layers import (Dense,Flatten,Conv1D,Embedding,MaxPool1D,Dropout,GlobalMaxPool1D)
-from keras.models import Sequential
-from keras.callbacks import ModelCheckpoint
-import random
-
-class Wavenet():
-    def __init__(self):
-        self.no_of_timesteps = 32
-        self.model = Sequential()
-
-    def construct(self, len_x, len_y): #len_x和len_y是一样的，这是源代码中不同音符的数量47
-        self.model.add(Embedding(len_x, 100, input_length=32, trainable=True)) #为什么这里要用len_y
-        self.model.add(Conv1D(64, 3, padding='causal', activation='relu'))
-        self.model.add(Dropout(0.2))
-        self.model.add(MaxPool1D(2))
-        self.model.add(Conv1D(128, 3, activation='relu', dilation_rate=2, padding='causal'))
-        self.model.add(Dropout(0.2))
-        self.model.add(MaxPool1D(2))
-        self.model.add(Conv1D(256, 3, activation='relu', dilation_rate=4, padding='causal'))
-        self.model.add(Dropout(0.2))
-        self.model.add(MaxPool1D(2))
-        self.model.add(GlobalMaxPool1D())
-        self.model.add(Dense(256, activation='relu'))
-        self.model.add(Dense(len_y, activation='softmax')) #我不清楚为什么要用len_y，但是我不知道为什么要用这个数字
-        self.model.compile(loss='sparse_categorical_crossentropy', optimizer='adam', metrics=['acc'])
-        self.model.summary()
-
-    def fit(self, x_tr, x_val, y_tr, y_val ):
-        self.model.fit(np.array(x_tr), np.array(y_tr), batch_size=128, epochs=5,
-                  validation_data=(np.array(x_val), np.array(y_val)), verbose=1)
-
-
-    def predict(self, x_val, unique_x):
-        ind = np.random.randint(0, len(x_val) - 1)
-
-        random_music = x_val[ind]
-
-        predictions = []
-        for i in range(10):
-            random_music = random_music.reshape(1, self.no_of_timesteps)
-
-            prob = self.model.predict(random_music)[0]
-            y_pred = np.argmax(prob, axis=0)
-            predictions.append(y_pred)
-
-            random_music = np.insert(random_music[0], len(random_music[0]), y_pred)
-            random_music = random_music[1:]
-
-        # x_int_to_note = dict((number, note_) for number, note_ in enumerate(unique_x))
-        # predicted_notes = [x_int_to_note[i] for i in predictions]
-
-        return predictions
-
-
-class ToMidi():
-    def __init__(self):
-        pass
-
-    def to_midi(self, prediction_output):
-        offset = 0
-        output_notes = []
-
-        # create note and chord objects based on the values generated by the model
-        for pattern in prediction_output:
-
-            # pattern is a chord
-            if ('.' in pattern) or pattern.isdigit():
-                notes_in_chord = pattern.split('.')
-                notes = []
-                for current_note in notes_in_chord:
-                    cn = int(current_note)
-                    new_note = note.Note(cn)
-                    new_note.storedInstrument = instrument.Piano()
-                    notes.append(new_note)
-
-                new_chord = chord.Chord(notes)
-                new_chord.offset = offset
-                output_notes.append(new_chord)
-
-            # pattern is a note
-            else:
-
-                new_note = note.Note(pattern)
-                new_note.offset = offset
-                new_note.storedInstrument = instrument.Piano()
-                output_notes.append(new_note)
-
-            # increase offset each iteration so that notes do not stack
-            offset += 1
-        midi_stream = stream.Stream(output_notes)
-        midi_stream.write('midi', fp='music.mid')
+        # decode the predictions
+        self.output = mu_law_decode(labels, self.quantization_channels)
+        sf.write("generated.wav", self.output, sampling_rate)
+        print("Finished generating audio")
