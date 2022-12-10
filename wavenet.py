@@ -51,6 +51,6 @@ class Wavenet(tf.keras.Model):
         print(f"Labels has shape {labels.shape}")
 
         # decode the predictions
-        self.output = mu_law_decode(labels, self.quantization_channels)
-        sf.write("generated.wav", self.output, sampling_rate)
+        self.out = mu_law_decode(labels, self.quantization_channels)
+        sf.write("generated.wav", self.out, sampling_rate)
         print("Finished generating audio")
